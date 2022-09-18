@@ -27,6 +27,11 @@ public:
 
 private:
   void timeout(const error_code& err) noexcept;
+
+  bool set_client_string() noexcept;
+  boost::asio::awaitable<error_code> read_request_begin(Request& request) noexcept;
+  boost::asio::awaitable<std::tuple<error_code, uint32_t>> read_socks4a_domain(std::string& buff) noexcept;
+
   boost::asio::awaitable<void> bind(Request request) noexcept;
   boost::asio::awaitable<void> connect(Request request) noexcept;
   boost::asio::awaitable<bool> send_response(Response::Code code, const Request& request) noexcept;

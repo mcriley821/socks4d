@@ -28,6 +28,16 @@
 #define REQUEST_TIMEOUT 120
 #endif
 
+
+#define SEND_ERROR_AND_RETURN_IF(err) \
+  if (err) { \
+    if (err != error::eof && err != error::operation_aborted) \
+      co_await send_response(Response::ERROR, request); \
+    BOOST_LOG_TRIVIAL(error) << client_str_ << " bad request: " << err.message(); \
+    co_return; \
+  }
+
+
 using namespace boost::asio;
 using namespace boost::asio::experimental::awaitable_operators;
 namespace ip = boost::asio::ip;
@@ -46,7 +56,8 @@ Connection::Connection(io_context& context, socket_t socket) noexcept
 
 Connection::~Connection() noexcept
 {
-  BOOST_LOG_TRIVIAL(info) << "closing connection with " << client_str_;
+  if (client_str_.size())
+    BOOST_LOG_TRIVIAL(info) << client_str_ << " closing connection";
   close(client_socket_);
 }
 
@@ -54,10 +65,8 @@ Connection::~Connection() noexcept
 void Connection::timeout(const error_code& err) noexcept
 {
   if (err) {
-    if (err != error::operation_aborted) {
-      BOOST_LOG_TRIVIAL(error)
-        << client_str_ << " timer error: " << err.message();
-    }
+    if (err != error::operation_aborted)
+      BOOST_LOG_TRIVIAL(error) << client_str_ << " timer error: " << err.message();
     return;
   }
   // expired
@@ -77,7 +86,7 @@ void Connection::close(socket_t& socket) noexcept
     socket.close(err);
     if (err) {
       BOOST_LOG_TRIVIAL(warning)
-        << "Could not close " << socket.local_endpoint() << ": " << err.message();
+        << socket.local_endpoint() << " close error: " << err.message();
     }
   }
 }
@@ -85,101 +94,28 @@ void Connection::close(socket_t& socket) noexcept
 
 awaitable<void> Connection::start() noexcept
 {
-  std::ostringstream oss;
-  error_code ec;
-  oss << client_socket_.remote_endpoint(ec);
-
-  if (ec) {
+  if (!set_client_string())
     co_return;
-  }
-
-  client_str_ = oss.str();
-
 
   Request request;
 
-  BOOST_LOG_TRIVIAL(trace) << "reading request from " << client_str_;
-  auto [err, n] = co_await async_read(
-      client_socket_, request.buffers<mutable_buffer>(), 
-      transfer_exactly(8), default_token());
+  error_code err_req = co_await read_request_begin(request);
+  SEND_ERROR_AND_RETURN_IF(err_req);
 
-  if (err) {
-    if (err != error::operation_aborted && err != error::eof) {
-      BOOST_LOG_TRIVIAL(error) << client_str_ << " connection error: " << err.message();
-      co_await send_response(Response::ERROR, request);
-    }
-    co_return;
-  }
-  else if (n != 8) {
-    BOOST_LOG_TRIVIAL(error) << client_str_ << " bad request";
-    co_await send_response(Response::ERROR, request);
-    co_return;
-  }
-  else if (request.version != 4) {
-    BOOST_LOG_TRIVIAL(error) << client_str_ << " bad version";
-    co_await send_response(Response::ERROR, request);
-    co_return;
-  }
-  else if (request.command != Request::CONNECT && request.command != Request::BIND) {
-    BOOST_LOG_TRIVIAL(error) << client_str_ << " bad command";
-    co_await send_response(Response::ERROR, request);
-    co_return;
-  }
-  BOOST_LOG_TRIVIAL(trace) << "reading ident of " << client_str_;
-  std::string string_buffer;
-  std::tie(err, n) = co_await async_read_until(
-      client_socket_, dynamic_buffer(string_buffer, IDENT_MAX_LEN), '\0', default_token());
+  std::string buff;
+  auto [err, n] = co_await async_read_until(
+      client_socket_, dynamic_buffer(buff, IDENT_MAX_LEN), '\0', default_token());
+  SEND_ERROR_AND_RETURN_IF(err);
 
-  if (err || n == 0) {
-    if (err && err != error::operation_aborted && err != error::eof) {
-      BOOST_LOG_TRIVIAL(error) << client_str_ << " connection error: " << err.message();
-      co_await send_response(Response::ERROR, request);
-    }
-    else if (n == 0) {
-      BOOST_LOG_TRIVIAL(error) << client_str_ << " bad ident";
-    }
-    co_return;
-  }
-  request.ident = string_buffer.substr(0, n);
-  string_buffer.erase(0, n);
+  request.ident = buff.substr(0, n);
+  buff.erase(0, n);
+
   request.port = ntohs(request.port);
   request.ipv4 = ntohl(request.ipv4);
 
-  BOOST_LOG_TRIVIAL(info) << client_str_ << " ident: " << request.ident;
-
   if (request.ipv4 < 256) { // socks4a request == 0.0.0.x
-    BOOST_LOG_TRIVIAL(debug) << client_str_ << " socks4a request";
-
-    std::tie(err, n) = co_await async_read_until(
-        client_socket_, dynamic_buffer(string_buffer, DOMAIN_MAX_LEN), '\0', default_token());
-
-    if (err || n == 0) {
-      if (err && err != error::operation_aborted && err != error::eof) {
-        BOOST_LOG_TRIVIAL(error) << client_str_ << "could not read domain: " << err.message();
-       co_await send_response(Response::ERROR, request);       
-      }
-      else if (n == 0) {
-        BOOST_LOG_TRIVIAL(error) << client_str_ << " bad domain";
-      }
-      co_return;
-    }
-    std::string domain = string_buffer.substr(0, n);
-    
-    using resolver_t = default_token::as_default_on_t<tcp::resolver>;
-    resolver_t resolver(co_await this_coro::executor);
-
-    auto [err, results] = co_await resolver.async_resolve(domain, "");
-    for (const auto& entry: results) {
-      if (entry.endpoint().address().is_v4()) {
-        request.ipv4 = entry.endpoint().address().to_v4().to_uint();
-        break;
-      }
-    }
-    if (request.ipv4 < 256) {
-      BOOST_LOG_TRIVIAL(error) << "could not resolve domain " << domain << " for " << client_str_;
-      co_await send_response(Response::ERROR, request);
-      co_return;
-    }
+    std::tie(err, request.ipv4) = co_await read_socks4a_domain(buff);
+    SEND_ERROR_AND_RETURN_IF(err);
   }
  
   if (request.command == Request::CONNECT)
@@ -188,6 +124,67 @@ awaitable<void> Connection::start() noexcept
     co_await bind(std::move(request));
 }
 
+
+bool Connection::set_client_string() noexcept
+{
+  error_code ec;
+  tcp::endpoint endpoint = client_socket_.remote_endpoint(ec);
+  if (ec) {
+    BOOST_LOG_TRIVIAL(error) << "client closed connection";
+    return false;
+  }
+
+  std::ostringstream oss;
+  oss << endpoint;
+  client_str_ = oss.str();
+  return true;
+}
+
+
+awaitable<error_code> Connection::read_request_begin(Request& request) noexcept
+{
+  BOOST_LOG_TRIVIAL(debug) << client_str_ << " reading request";
+
+  auto [err, n] = co_await async_read(
+      client_socket_, request.buffers<mutable_buffer>(), 
+      transfer_exactly(8), default_token());
+
+  if (err)
+    co_return err;
+  
+  if (request.version != 4)
+    err = socks4::error::bad_version;
+  else if (request.command != Request::CONNECT && request.command != Request::BIND)
+    err = socks4::error::bad_command;
+  co_return err;
+}
+
+
+awaitable<std::tuple<error_code, uint32_t>> Connection::read_socks4a_domain(std::string& buff) noexcept
+{
+  BOOST_LOG_TRIVIAL(debug) << client_str_ << " socks4a request";
+
+  auto [err, n] = co_await async_read_until(
+      client_socket_, dynamic_buffer(buff, DOMAIN_MAX_LEN), '\0', default_token());
+
+  if (err)
+    co_return std::tuple{err, 0};
+
+  std::string domain = buff.substr(0, n);
+  
+  using resolver_t = default_token::as_default_on_t<tcp::resolver>;
+  resolver_t resolver(co_await this_coro::executor);
+
+  auto [err_resolve, results] = co_await resolver.async_resolve(domain, "");
+  if (err_resolve)
+    co_return std::tuple{err_resolve, 0};
+
+  for (const auto& entry: results)
+    if (entry.endpoint().address().is_v4())
+      co_return std::tuple{error_code(), entry.endpoint().address().to_v4().to_uint()};
+
+  co_return std::tuple{error::host_not_found, 0};
+}
 
 awaitable<void> Connection::connect(Request request) noexcept
 {
